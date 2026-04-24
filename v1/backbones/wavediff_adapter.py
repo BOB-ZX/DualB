@@ -48,7 +48,7 @@ class WaveDiffNCSNppAdapter(nn.Module):
             "embedding_type": "positional",
             "fourier_scale": 16.0,
             "patch_size": 1,
-            "not_use_tanh": True,
+            "not_use_tanh": False,
             "z_emb_dim": 256,
             "nz": 100,
             "n_mlp": 3,

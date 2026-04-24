@@ -126,7 +126,7 @@ class BridgeRunner(L.LightningModule):
             wavelet,
             base_channels=self.base_channels,
             output_size=out_size,
-        )
+        ).clamp(-1.0, 1.0)
 
     def training_step(self, batch, batch_idx=None):
         x0, _, _ = batch
@@ -221,7 +221,11 @@ class BridgeRunner(L.LightningModule):
         y_wavelet = out["y_wavelet"]
         pred_wavelet = self.diffusion.sample_wavelet_x0(y_wavelet, self._predict_wavelet_x0)
         return self._inverse_wavelet(pred_wavelet, x0.shape[-2:])
-
+    def _to01_for_check(self, x):
+        x = x.detach().float()
+        if x.min() < -0.1:
+            x = (x + 1.0) / 2.0
+        return x.clamp(0, 1)
     def validation_step(self, batch, batch_idx):
         x0, _, _ = batch
         x0_pred = self._sample_image(batch)
@@ -231,6 +235,28 @@ class BridgeRunner(L.LightningModule):
         self.log("val_psnr", metrics["psnr_mean"].mean(), on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("val_ssim", metrics["ssim_mean"].mean(), on_epoch=True, prog_bar=True, sync_dist=True)
         if batch_idx == 0 and self.global_rank == 0:
+            
+            x0_vis = self._to01_for_check(x0)
+            pred_vis = self._to01_for_check(x0_pred)
+
+            bg = x0_vis < 1e-3
+            if bg.any():
+                target_bg_mean = float(x0_vis[bg].mean())
+                pred_bg_mean = float(pred_vis[bg].mean())
+                pred_bg_max = float(pred_vis[bg].max())
+            else:
+                target_bg_mean = float("nan")
+                pred_bg_mean = float("nan")
+                pred_bg_max = float("nan")
+
+            print(
+                "x0 range", float(x0.min()), float(x0.max()),
+                "pred range", float(x0_pred.min()), float(x0_pred.max()),
+                "target bg mean", target_bg_mean,
+                "pred bg mean", pred_bg_mean,
+                "pred bg max", pred_bg_max,
+            )
+            
             path = os.path.join(self.logger.log_dir, "val_samples", f"epoch_{self.current_epoch}.png")
             save_image_pair(x0, x0_pred, path)
 

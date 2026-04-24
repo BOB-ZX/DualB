@@ -91,7 +91,7 @@ model:
     nz: 100                             # Number of latent dimensions
     n_mlp: 3                            # Number of MLP layers
     centered: True                      # Whether to center the input
-    not_use_tanh: True                 # Whether to use tanh activation
+    not_use_tanh: False                 # Whether to use tanh activation
     num_channels_dae: 64
     no_use_fbn: false
     no_use_freq: false
