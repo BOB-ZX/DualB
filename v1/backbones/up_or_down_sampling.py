@@ -1,173 +1,262 @@
-from __future__ import annotations
+# ---------------------------------------------------------------
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# ---------------------------------------------------------------
 
-from typing import Any, Dict, Tuple
 
+"""Layers used for up-sampling or down-sampling images.
+
+Many functions are ported from https://github.com/NVlabs/stylegan2.
+"""
+
+import numpy as np
 import torch
 import torch.nn as nn
-from torch import Tensor
+import torch.nn.functional as F
+from op import upfirdn2d
 
-from DWT_IDWT.DWT_IDWT_layer import DWT_2D, IDWT_2D
+
+# Function ported from StyleGAN2
+def get_weight(module,
+               shape,
+               weight_var='weight',
+               kernel_init=None):
+    """Get/create weight tensor for a convolution or fully-connected layer."""
+
+    return module.param(weight_var, kernel_init, shape)
 
 
-class PairWaveletBatchTransform(nn.Module):
-    """Data-level one-step Haar DWT/IWT used by the training loop.
+class Conv2d(nn.Module):
+    """Conv2d layer with optimal upsampling and downsampling (StyleGAN2)."""
 
-    This module intentionally uses the same DWT_2D and IDWT_2D implementation
-    as WaveDiff. It handles image-level decomposition for the diffusion process.
-    The DWT/IWT inside WaveletNCSNpp is feature-level processing and does not
-    replace this module.
+    def __init__(self, in_ch, out_ch, kernel, up=False, down=False,
+                 resample_kernel=(1, 3, 3, 1),
+                 use_bias=True,
+                 kernel_init=None):
+        super().__init__()
+        assert not (up and down)
+        assert kernel >= 1 and kernel % 2 == 1
+        self.weight = nn.Parameter(torch.zeros(out_ch, in_ch, kernel, kernel))
+        if kernel_init is not None:
+            self.weight.data = kernel_init(self.weight.data.shape)
+        if use_bias:
+            self.bias = nn.Parameter(torch.zeros(out_ch))
 
-    Channel order is fixed as [LL, LH, HL, HH].
+        self.up = up
+        self.down = down
+        self.resample_kernel = resample_kernel
+        self.kernel = kernel
+        self.use_bias = use_bias
+
+    def forward(self, x):
+        if self.up:
+            x = upsample_conv_2d(x, self.weight, k=self.resample_kernel)
+        elif self.down:
+            x = conv_downsample_2d(x, self.weight, k=self.resample_kernel)
+        else:
+            x = F.conv2d(x, self.weight, stride=1, padding=self.kernel // 2)
+
+        if self.use_bias:
+            x = x + self.bias.reshape(1, -1, 1, 1)
+
+        return x
+
+
+def naive_upsample_2d(x, factor=2):
+    _N, C, H, W = x.shape
+    x = torch.reshape(x, (-1, C, H, 1, W, 1))
+    x = x.repeat(1, 1, 1, factor, 1, factor)
+    return torch.reshape(x, (-1, C, H * factor, W * factor))
+
+
+def naive_downsample_2d(x, factor=2):
+    _N, C, H, W = x.shape
+    x = torch.reshape(x, (-1, C, H // factor, factor, W // factor, factor))
+    return torch.mean(x, dim=(3, 5))
+
+
+def upsample_conv_2d(x, w, k=None, factor=2, gain=1):
+    """Fused `upsample_2d()` followed by `tf.nn.conv2d()`.
+
+         Padding is performed only once at the beginning, not between the
+         operations.
+         The fused op is considerably more efficient than performing the same
+         calculation
+         using standard TensorFlow ops. It supports gradients of arbitrary order.
+         Args:
+             x:                      Input tensor of the shape `[N, C, H, W]` or `[N, H, W,
+                 C]`.
+             w:                      Weight tensor of the shape `[filterH, filterW, inChannels,
+                 outChannels]`. Grouped convolution can be performed by `inChannels =
+                 x.shape[0] // numGroups`.
+             k:                      FIR filter of the shape `[firH, firW]` or `[firN]`
+                 (separable). The default is `[1] * factor`, which corresponds to
+                 nearest-neighbor upsampling.
+             factor:             Integer upsampling factor (default: 2).
+             gain:               Scaling factor for signal magnitude (default: 1.0).
+
+         Returns:
+             Tensor of the shape `[N, C, H * factor, W * factor]` or
+             `[N, H * factor, W * factor, C]`, and same datatype as `x`.
     """
 
-    def __init__(
-        self,
-        wave: str = "haar",
-        mode: str | None = None,
-        J: int = 1,
-        wavelet_scale: float = 1.0,
-    ) -> None:
-        super().__init__()
-        if J != 1:
-            raise ValueError(f"Only one-level DWT is supported, got J={J}")
-        if wave != "haar":
-            raise ValueError(f"WaveDiff uses haar wavelets, got wave={wave}")
+    assert isinstance(factor, int) and factor >= 1
 
-        self.wave = wave
-        self.mode = mode
-        self.J = int(J)
-        self.wavelet_scale = float(wavelet_scale)
-        self.dwt = DWT_2D(wave)
-        self.iwt = IDWT_2D(wave)
+    # Check weight shape.
+    assert len(w.shape) == 4
+    convH = w.shape[2]
+    convW = w.shape[3]
+    inC = w.shape[1]
+    # outC = w.shape[0]
 
-    def forward(self, batch: Tuple[Tensor, Tensor, Any] | Tuple[Tensor, Tensor]) -> Dict[str, Tensor]:
-        if not isinstance(batch, (tuple, list)) or len(batch) < 2:
-            raise ValueError("batch must be a tuple or list whose first two elements are x0 and y")
+    assert convW == convH
 
-        x0 = batch[0]
-        y = batch[1]
-        if x0.ndim != 4 or y.ndim != 4:
-            raise ValueError(f"x0 and y must be BCHW tensors, got {tuple(x0.shape)} and {tuple(y.shape)}")
-        if x0.shape != y.shape:
-            raise ValueError(f"x0 and y must have the same shape, got {tuple(x0.shape)} and {tuple(y.shape)}")
+    # Setup filter kernel.
+    if k is None:
+        k = [1] * factor
+    k = _setup_kernel(k) * (gain * (factor ** 2))
+    p = (k.shape[0] - factor) - (convW - 1)
 
-        x0_ll, x0_lh, x0_hl, x0_hh = self.decompose(x0)
-        y_ll, y_lh, y_hl, y_hh = self.decompose(y)
+    stride = (factor, factor)
 
-        x0_hf = self.pack_hf(x0_lh, x0_hl, x0_hh)
-        y_hf = self.pack_hf(y_lh, y_hl, y_hh)
-        x0_wavelet = self.pack_wavelet(x0_ll, x0_lh, x0_hl, x0_hh)
-        y_wavelet = self.pack_wavelet(y_ll, y_lh, y_hl, y_hh)
+    # Determine data dimensions.
+    stride = [1, 1, factor, factor]
+    output_shape = ((_shape(x, 2) - 1) * factor + convH, (_shape(x, 3) - 1) * factor + convW)
+    output_padding = (output_shape[0] - (_shape(x, 2) - 1) * stride[0] - convH,
+                      output_shape[1] - (_shape(x, 3) - 1) * stride[1] - convW)
+    assert output_padding[0] >= 0 and output_padding[1] >= 0
+    num_groups = _shape(x, 1) // inC
 
-        return {
-            "x0": x0,
-            "y": y,
-            "x0_ll": x0_ll,
-            "x0_lh": x0_lh,
-            "x0_hl": x0_hl,
-            "x0_hh": x0_hh,
-            "x0_hf": x0_hf,
-            "x0_hf_cat": x0_hf,
-            "x0_wavelet": x0_wavelet,
-            "x0_wavelet_cat": x0_wavelet,
-            "y_ll": y_ll,
-            "y_lh": y_lh,
-            "y_hl": y_hl,
-            "y_hh": y_hh,
-            "y_hf": y_hf,
-            "y_hf_cat": y_hf,
-            "y_wavelet": y_wavelet,
-            "y_wavelet_cat": y_wavelet,
-        }
+    # Transpose weights.
+    w = torch.reshape(w, (num_groups, -1, inC, convH, convW))
+    w = w[..., ::-1, ::-1].permute(0, 2, 1, 3, 4)
+    w = torch.reshape(w, (num_groups * inC, -1, convH, convW))
 
-    def decompose(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        ll, lh, hl, hh = self.dwt(x)
-        if self.wavelet_scale != 1.0:
-            ll = ll * self.wavelet_scale
-            lh = lh * self.wavelet_scale
-            hl = hl * self.wavelet_scale
-            hh = hh * self.wavelet_scale
-        return ll, lh, hl, hh
+    x = F.conv_transpose2d(x, w, stride=stride, output_padding=output_padding, padding=0)
+    # Original TF code.
+    # x = tf.nn.conv2d_transpose(
+    #           x,
+    #           w,
+    #           output_shape=output_shape,
+    #           strides=stride,
+    #           padding='VALID',
+    #           data_format=data_format)
+    # JAX equivalent
 
-    def reconstruct(self, ll: Tensor, lh: Tensor, hl: Tensor, hh: Tensor, output_size=None) -> Tensor:
-        if self.wavelet_scale != 1.0:
-            inv_scale = 1.0 / self.wavelet_scale
-            ll = ll * inv_scale
-            lh = lh * inv_scale
-            hl = hl * inv_scale
-            hh = hh * inv_scale
-        x = self.iwt(ll, lh, hl, hh)
-        return self._match_output_size(x, output_size)
+    return upfirdn2d(x, torch.tensor(k, device=x.device),
+                     pad=((p + 1) // 2 + factor - 1, p // 2 + 1))
 
-    @staticmethod
-    def pack_hf(lh: Tensor, hl: Tensor, hh: Tensor) -> Tensor:
-        return torch.cat([lh, hl, hh], dim=1)
 
-    @staticmethod
-    def unpack_hf(hf: Tensor, base_channels: int | None = None) -> Tuple[Tensor, Tensor, Tensor]:
-        if base_channels is None:
-            if hf.shape[1] % 3 != 0:
-                raise ValueError(f"HF channels must be divisible by 3, got {hf.shape[1]}")
-            base_channels = hf.shape[1] // 3
-        if hf.shape[1] != 3 * base_channels:
-            raise ValueError(f"Expected {3 * base_channels} HF channels, got {hf.shape[1]}")
-        lh = hf[:, :base_channels]
-        hl = hf[:, base_channels: 2 * base_channels]
-        hh = hf[:, 2 * base_channels: 3 * base_channels]
-        return lh, hl, hh
+def conv_downsample_2d(x, w, k=None, factor=2, gain=1):
+    """Fused `tf.nn.conv2d()` followed by `downsample_2d()`.
 
-    @staticmethod
-    def pack_wavelet(ll: Tensor, lh: Tensor, hl: Tensor, hh: Tensor) -> Tensor:
-        return torch.cat([ll, lh, hl, hh], dim=1)
+        Padding is performed only once at the beginning, not between the operations.
+        The fused op is considerably more efficient than performing the same
+        calculation
+        using standard TensorFlow ops. It supports gradients of arbitrary order.
+        Args:
+                x:                      Input tensor of the shape `[N, C, H, W]` or `[N, H, W,
+                    C]`.
+                w:                      Weight tensor of the shape `[filterH, filterW, inChannels,
+                    outChannels]`. Grouped convolution can be performed by `inChannels =
+                    x.shape[0] // numGroups`.
+                k:                      FIR filter of the shape `[firH, firW]` or `[firN]`
+                    (separable). The default is `[1] * factor`, which corresponds to
+                    average pooling.
+                factor:             Integer downsampling factor (default: 2).
+                gain:                   Scaling factor for signal magnitude (default: 1.0).
 
-    @staticmethod
-    def unpack_wavelet(wavelet: Tensor, base_channels: int | None = None) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        if base_channels is None:
-            if wavelet.shape[1] % 4 != 0:
-                raise ValueError(f"Wavelet channels must be divisible by 4, got {wavelet.shape[1]}")
-            base_channels = wavelet.shape[1] // 4
-        if wavelet.shape[1] != 4 * base_channels:
-            raise ValueError(f"Expected {4 * base_channels} wavelet channels, got {wavelet.shape[1]}")
-        ll = wavelet[:, :base_channels]
-        lh = wavelet[:, base_channels: 2 * base_channels]
-        hl = wavelet[:, 2 * base_channels: 3 * base_channels]
-        hh = wavelet[:, 3 * base_channels: 4 * base_channels]
-        return ll, lh, hl, hh
+        Returns:
+                Tensor of the shape `[N, C, H // factor, W // factor]` or
+                `[N, H // factor, W // factor, C]`, and same datatype as `x`.
+    """
 
-    def inverse_from_parts(self, ll: Tensor, lh: Tensor, hl: Tensor, hh: Tensor, output_size=None) -> Tensor:
-        return self.reconstruct(ll, lh, hl, hh, output_size=output_size)
+    assert isinstance(factor, int) and factor >= 1
+    _outC, _inC, convH, convW = w.shape
+    assert convW == convH
+    if k is None:
+        k = [1] * factor
+    k = _setup_kernel(k) * gain
+    p = (k.shape[0] - factor) + (convW - 1)
+    s = [factor, factor]
+    x = upfirdn2d(x, torch.tensor(k, device=x.device),
+                  pad=((p + 1) // 2, p // 2))
+    return F.conv2d(x, w, stride=s, padding=0)
 
-    def inverse_from_hf_cat(self, ll: Tensor, hf: Tensor, base_channels: int | None = None, output_size=None) -> Tensor:
-        lh, hl, hh = self.unpack_hf(hf, base_channels=base_channels)
-        return self.reconstruct(ll, lh, hl, hh, output_size=output_size)
 
-    def inverse_from_cat(self, wavelet: Tensor, base_channels: int | None = None, output_size=None) -> Tensor:
-        ll, lh, hl, hh = self.unpack_wavelet(wavelet, base_channels=base_channels)
-        return self.reconstruct(ll, lh, hl, hh, output_size=output_size)
+def _setup_kernel(k):
+    k = np.asarray(k, dtype=np.float32)
+    if k.ndim == 1:
+        k = np.outer(k, k)
+    k /= np.sum(k)
+    assert k.ndim == 2
+    assert k.shape[0] == k.shape[1]
+    return k
 
-    def inverse_from_wavelet_cat(self, wavelet: Tensor, base_channels: int | None = None, output_size=None) -> Tensor:
-        return self.inverse_from_cat(wavelet, base_channels=base_channels, output_size=output_size)
 
-    @staticmethod
-    def _match_output_size(x: Tensor, output_size) -> Tensor:
-        if output_size is None:
-            return x
-        if isinstance(output_size, torch.Tensor):
-            output_size = tuple(int(v) for v in output_size.detach().cpu().flatten().tolist())
-        if isinstance(output_size, torch.Size):
-            output_size = tuple(output_size)
-        if len(output_size) >= 2:
-            target_h = int(output_size[-2])
-            target_w = int(output_size[-1])
-        else:
-            raise ValueError(f"output_size must contain height and width, got {output_size}")
+def _shape(x, dim):
+    return x.shape[dim]
 
-        h, w = x.shape[-2:]
-        if h == target_h and w == target_w:
-            return x
-        x = x[..., :target_h, :target_w]
-        pad_h = max(target_h - x.shape[-2], 0)
-        pad_w = max(target_w - x.shape[-1], 0)
-        if pad_h > 0 or pad_w > 0:
-            x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h))
-        return x
+
+def upsample_2d(x, k=None, factor=2, gain=1):
+    r"""Upsample a batch of 2D images with the given filter.
+
+        Accepts a batch of 2D images of the shape `[N, C, H, W]` or `[N, H, W, C]`
+        and upsamples each image with the given filter. The filter is normalized so
+        that
+        if the input pixels are constant, they will be scaled by the specified
+        `gain`.
+        Pixels outside the image are assumed to be zero, and the filter is padded
+        with
+        zeros so that its shape is a multiple of the upsampling factor.
+        Args:
+                x:                      Input tensor of the shape `[N, C, H, W]` or `[N, H, W,
+                    C]`.
+                k:                      FIR filter of the shape `[firH, firW]` or `[firN]`
+                    (separable). The default is `[1] * factor`, which corresponds to
+                    nearest-neighbor upsampling.
+                factor:             Integer upsampling factor (default: 2).
+                gain:                   Scaling factor for signal magnitude (default: 1.0).
+
+        Returns:
+                Tensor of the shape `[N, C, H * factor, W * factor]`
+    """
+    assert isinstance(factor, int) and factor >= 1
+    if k is None:
+        k = [1] * factor
+    k = _setup_kernel(k) * (gain * (factor ** 2))
+    p = k.shape[0] - factor
+    return upfirdn2d(x, torch.tensor(k, device=x.device),
+                     up=factor, pad=((p + 1) // 2 + factor - 1, p // 2))
+
+
+def downsample_2d(x, k=None, factor=2, gain=1):
+    r"""Downsample a batch of 2D images with the given filter.
+
+        Accepts a batch of 2D images of the shape `[N, C, H, W]` or `[N, H, W, C]`
+        and downsamples each image with the given filter. The filter is normalized
+        so that
+        if the input pixels are constant, they will be scaled by the specified
+        `gain`.
+        Pixels outside the image are assumed to be zero, and the filter is padded
+        with
+        zeros so that its shape is a multiple of the downsampling factor.
+        Args:
+                x:                      Input tensor of the shape `[N, C, H, W]` or `[N, H, W,
+                    C]`.
+                k:                      FIR filter of the shape `[firH, firW]` or `[firN]`
+                    (separable). The default is `[1] * factor`, which corresponds to
+                    average pooling.
+                factor:             Integer downsampling factor (default: 2).
+                gain:                   Scaling factor for signal magnitude (default: 1.0).
+
+        Returns:
+                Tensor of the shape `[N, C, H // factor, W // factor]`
+    """
+
+    assert isinstance(factor, int) and factor >= 1
+    if k is None:
+        k = [1] * factor
+    k = _setup_kernel(k) * gain
+    p = k.shape[0] - factor
+    return upfirdn2d(x, torch.tensor(k, device=x.device),
+                     down=factor, pad=((p + 1) // 2, p // 2))
