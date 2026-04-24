@@ -40,12 +40,12 @@ model:
   lr_g: 0.00016                         # Learning rate for the generator
   lr_d: 0.0001                          # Learning rate for the discriminator
   disc_grad_penalty_freq: 10            # Frequency of the gradient penalty calculation for the discriminator
-  disc_grad_penalty_weight: 0.5         # Gradient penalty weight for the discriminator
-  lambda_rec_loss: 1.0                  # Reconstruction loss weight
+  disc_grad_penalty_weight: 0.1         # Gradient penalty weight for the discriminator
+  lambda_rec_loss: 0.25                  # Reconstruction loss weight
   lambda_adv_loss: 1.0
-  lambda_ll_loss: 1.5
+  lambda_ll_loss: 0.5
   lambda_hf_loss: 0.25
-  lambda_img_loss: 1.0
+  lambda_img_loss: 0.5
   lambda_prev_ll_loss: 0.05
   wavelet_scale: 2.0
   optim_betas: [0.5, 0.9]               # Adam optimizer betas
@@ -68,7 +68,7 @@ model:
     self_recursion: True                # Whether to use self-consistent recursion
     image_size: 128                     # Image size ${data.image_size}/2
     z_emb_dim: 256                      # Dimension of the latent embedding
-    ch_mult: [1, 2, 2, 2, 4]            # Channel multipliers for each resolution
+    ch_mult: [1, 1, 2, 2, 4, 4]            # Channel multipliers for each resolution
     num_res_blocks: 2                   # Number of residual blocks
     attn_resolutions: [16]              # Resolutions to apply attention
     dropout: 0.0                        # Dropout rate
@@ -100,7 +100,7 @@ model:
 
   discriminator_params:
     nc: 8                               # Number of channels in the input (x_t, x_{t-1})
-    ngf: 32                             # Number of generator filters
+    ngf: 64                             # Number of generator filters
     t_emb_dim: 256                      # Dimension of the temporal embedding
 
 data:

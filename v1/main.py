@@ -203,12 +203,6 @@ class BridgeRunner(L.LightningModule):
         self.manual_backward(g_loss)
         optimizer_g.step()
         self.untoggle_optimizer(optimizer_g)
-        print("x0", x0.min().item(), x0.max().item(), x0.shape)
-        print("x0_wavelet", x0_wavelet.min().item(), x0_wavelet.max().item(), x0_wavelet.shape)
-        print("y_wavelet", y_wavelet.min().item(), y_wavelet.max().item(), y_wavelet.shape)
-        print("x_t", x_t.min().item(), x_t.max().item(), x_t.shape)
-        print("x0_pred", x0_pred.min().item(), x0_pred.max().item(), x0_pred.shape)
-        print("pred_img", pred_img.min().item(), pred_img.max().item(), pred_img.shape)
 
         self.log("d_loss/real", d_real_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("d_loss/fake", d_fake_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
@@ -236,40 +230,77 @@ class BridgeRunner(L.LightningModule):
         if x.min() < -0.1:
             x = (x + 1.0) / 2.0
         return x.clamp(0, 1)
+    # def validation_step(self, batch, batch_idx):
+    #     x0, _, _ = batch
+    #     x0_pred = self._sample_image(batch)
+    #     loss = F.mse_loss(x0_pred, x0)
+    #     metrics = compute_metrics(x0, x0_pred)
+    #     self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
+    #     self.log("val_psnr", metrics["psnr_mean"].mean(), on_epoch=True, prog_bar=True, sync_dist=True)
+    #     self.log("val_ssim", metrics["ssim_mean"].mean(), on_epoch=True, prog_bar=True, sync_dist=True)
+    #     print("x0", x0.min().item(), x0.max().item(), x0.shape)
+    #     print("x0_wavelet", x0_wavelet.min().item(), x0_wavelet.max().item(), x0_wavelet.shape)
+    #     print("y_wavelet", y_wavelet.min().item(), y_wavelet.max().item(), y_wavelet.shape)
+    #     print("x_t", x_t.min().item(), x_t.max().item(), x_t.shape)
+    #     print("x0_pred", x0_pred.min().item(), x0_pred.max().item(), x0_pred.shape)
+    #     print("pred_img", pred_img.min().item(), pred_img.max().item(), pred_img.shape)
+    #     path = os.path.join(self.logger.log_dir, "val_samples", f"epoch_{self.current_epoch}.png")
+    #     save_image_pair(x0, x0_pred, path)
     def validation_step(self, batch, batch_idx):
         x0, _, _ = batch
-        x0_pred = self._sample_image(batch)
+
+        out = self.wavelet_transform(batch)
+        x0_wavelet = out["x0_wavelet"]
+        y_wavelet = out["y_wavelet"]
+
+        pred_wavelet = self.diffusion.sample_wavelet_x0(
+            y_wavelet,
+            self._predict_wavelet_x0,
+        )
+
+        pred_img = self._inverse_wavelet(pred_wavelet, x0.shape[-2:])
+        x0_pred = torch.clamp(pred_img, -1.0, 1.0)
+
         loss = F.mse_loss(x0_pred, x0)
         metrics = compute_metrics(x0, x0_pred)
+
         self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("val_psnr", metrics["psnr_mean"].mean(), on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("val_ssim", metrics["ssim_mean"].mean(), on_epoch=True, prog_bar=True, sync_dist=True)
+
         if batch_idx == 0 and self.global_rank == 0:
-            
-            x0_vis = self._to01_for_check(x0)
-            pred_vis = self._to01_for_check(x0_pred)
+            with torch.no_grad():
+                t_dbg = torch.full(
+                    (x0_wavelet.shape[0],),
+                    self.n_steps,
+                    device=x0_wavelet.device,
+                    dtype=torch.long,
+                )
 
-            bg = x0_vis < 1e-3
-            if bg.any():
-                target_bg_mean = float(x0_vis[bg].mean())
-                pred_bg_mean = float(pred_vis[bg].mean())
-                pred_bg_max = float(pred_vis[bg].max())
-            else:
-                target_bg_mean = float("nan")
-                pred_bg_mean = float("nan")
-                pred_bg_max = float("nan")
+                _, x_t_dbg = self.diffusion.q_sample_mixed_pair(
+                    t_dbg,
+                    x0_wavelet,
+                    y_wavelet,
+                )
 
-            print(
-                "x0 range", float(x0.min()), float(x0.max()),
-                "pred range", float(x0_pred.min()), float(x0_pred.max()),
-                "target bg mean", target_bg_mean,
-                "pred bg mean", pred_bg_mean,
-                "pred bg max", pred_bg_max,
+                print("\n[Validation range check]")
+                print("x0", x0.min().item(), x0.max().item(), x0.shape)
+                print("x0_wavelet", x0_wavelet.min().item(), x0_wavelet.max().item(), x0_wavelet.shape)
+                print("y_wavelet", y_wavelet.min().item(), y_wavelet.max().item(), y_wavelet.shape)
+                print("x_t_dbg", x_t_dbg.min().item(), x_t_dbg.max().item(), x_t_dbg.shape)
+                print("pred_wavelet", pred_wavelet.min().item(), pred_wavelet.max().item(), pred_wavelet.shape)
+                print("pred_img_raw", pred_img.min().item(), pred_img.max().item(), pred_img.shape)
+                print("x0_pred_clamped", x0_pred.min().item(), x0_pred.max().item(), x0_pred.shape)
+                print("x0_wavelet abs mean", x0_wavelet.abs().mean().item())
+                print("pred_wavelet abs mean", pred_wavelet.abs().mean().item())
+                print("pred_img abs mean", pred_img.abs().mean().item())
+
+            path = os.path.join(
+                self.logger.log_dir,
+                "val_samples",
+                f"epoch_{self.current_epoch}.png",
             )
-            
-            path = os.path.join(self.logger.log_dir, "val_samples", f"epoch_{self.current_epoch}.png")
             save_image_pair(x0, x0_pred, path)
-
     def on_test_start(self):
         self.test_samples = []
         self.mask = None
