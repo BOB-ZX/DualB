@@ -47,7 +47,7 @@ model:
   lambda_hf_loss: 0.25
   lambda_img_loss: 1.0
   lambda_prev_ll_loss: 0.05
-  wavelet_scale: 1.0
+  wavelet_scale: 2.0
   optim_betas: [0.5, 0.9]               # Adam optimizer betas
   eval_mask: True                      # Whether to use mask during test
   eval_subject: True                    # Whether to evaluate subject-wise during test (`subject_ids` should be provided in the test dataset)
@@ -57,8 +57,8 @@ model:
     beta_start: 0.1                     # Beta start value of the diffusion process
     beta_end: 3.0                       # Beta end value of the diffusion process
     gamma: 1                            # Gamma value that controls noise in the end-point of the bridge
-    n_recursions: 1                     # Max number of recursions (R)
-    consistency_threshold: 0.00         # Self-consistency threshold for the recursive step
+    n_recursions: 2                     # Max number of recursions (R)
+    consistency_threshold: 0.01         # Self-consistency threshold for the recursive step
     base_channels: 1
     hf_beta_min: 0.1
     hf_beta_max: 20.0
@@ -96,7 +96,7 @@ model:
     no_use_fbn: false
     no_use_freq: false
     no_use_residual: false
-    concat_x_r: false
+    concat_x_r: True
 
   discriminator_params:
     nc: 8                               # Number of channels in the input (x_t, x_{t-1})

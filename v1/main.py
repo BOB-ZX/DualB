@@ -74,10 +74,12 @@ class BridgeRunner(L.LightningModule):
         self.wavelet_channels = 4 * self.base_channels
 
         generator_params = dict(generator_params)
-        generator_params.setdefault("num_channels", 2 * self.wavelet_channels)
-        generator_params.setdefault("num_out_channels", self.wavelet_channels)
+        use_recursive_state = bool(generator_params.get("concat_x_r", False))
+        generator_params["num_channels"] = (3 if use_recursive_state else 2) * self.wavelet_channels
+        generator_params["num_out_channels"] = self.wavelet_channels
         self.latent_dim = int(latent_dim or generator_params.get("nz", 100))
         self.generator = WaveDiffNCSNpp(**generator_params)
+
 
         discriminator_params = dict(discriminator_params)
         discriminator_params.setdefault("nc", 2 * self.wavelet_channels)
@@ -107,8 +109,9 @@ class BridgeRunner(L.LightningModule):
         gen_input = torch.cat([x_t_wavelet.detach(), y_wavelet], dim=1)
         x0_r = torch.zeros_like(x_t_wavelet)
         pred = x0_r
+        z = self._latent(x_t_wavelet.shape[0], x_t_wavelet.device, x_t_wavelet.dtype)
+
         for _ in range(max(self.n_recursions, 1)):
-            z = self._latent(x_t_wavelet.shape[0], x_t_wavelet.device, x_t_wavelet.dtype)
             pred_next = self.generator(gen_input, t, z=z, x_r=x0_r)
             if self.consistency_threshold > 0.0:
                 change = torch.abs(pred_next - x0_r).mean(dim=(1, 2, 3)).max()
@@ -200,6 +203,12 @@ class BridgeRunner(L.LightningModule):
         self.manual_backward(g_loss)
         optimizer_g.step()
         self.untoggle_optimizer(optimizer_g)
+        print("x0", x0.min().item(), x0.max().item(), x0.shape)
+        print("x0_wavelet", x0_wavelet.min().item(), x0_wavelet.max().item(), x0_wavelet.shape)
+        print("y_wavelet", y_wavelet.min().item(), y_wavelet.max().item(), y_wavelet.shape)
+        print("x_t", x_t.min().item(), x_t.max().item(), x_t.shape)
+        print("x0_pred", x0_pred.min().item(), x0_pred.max().item(), x0_pred.shape)
+        print("pred_img", pred_img.min().item(), pred_img.max().item(), pred_img.shape)
 
         self.log("d_loss/real", d_real_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("d_loss/fake", d_fake_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
@@ -220,7 +229,8 @@ class BridgeRunner(L.LightningModule):
         out = self.wavelet_transform(batch)
         y_wavelet = out["y_wavelet"]
         pred_wavelet = self.diffusion.sample_wavelet_x0(y_wavelet, self._predict_wavelet_x0)
-        return self._inverse_wavelet(pred_wavelet, x0.shape[-2:])
+        pred_img = self._inverse_wavelet(pred_wavelet, x0.shape[-2:])
+        return torch.clamp(pred_img, -1.0, 1.0)
     def _to01_for_check(self, x):
         x = x.detach().float()
         if x.min() < -0.1:

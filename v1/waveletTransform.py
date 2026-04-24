@@ -4,34 +4,27 @@ from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from DWT_IDWT.DWT_IDWT_layer import DWT_2D, IDWT_2D
 
 
 class PairWaveletBatchTransform(nn.Module):
-    """Data-level one-step Haar DWT/IWT used by the training loop.
-
-    This module intentionally uses the same DWT_2D and IDWT_2D implementation
-    as WaveDiff. It handles image-level decomposition for the diffusion process.
-    The DWT/IWT inside WaveletNCSNpp is feature-level processing and does not
-    replace this module.
-
-    Channel order is fixed as [LL, LH, HL, HH].
-    """
-
     def __init__(
         self,
         wave: str = "haar",
         mode: str | None = None,
         J: int = 1,
-        wavelet_scale: float = 1.0,
+        wavelet_scale: float = 2.0,
     ) -> None:
         super().__init__()
         if J != 1:
-            raise ValueError(f"Only one-level DWT is supported, got J={J}")
+            raise ValueError(f"Only J=1 is supported for now, got {J}")
         if wave != "haar":
-            raise ValueError(f"WaveDiff uses haar wavelets, got wave={wave}")
+            raise ValueError(f"Only haar wave is supported for consistency with WaveDiff, got {wave}")
+        if wavelet_scale <= 0:
+            raise ValueError(f"wavelet_scale must be positive, got {wavelet_scale}")
 
         self.wave = wave
         self.mode = mode
@@ -42,10 +35,10 @@ class PairWaveletBatchTransform(nn.Module):
 
     def forward(self, batch: Tuple[Tensor, Tensor, Any] | Tuple[Tensor, Tensor]) -> Dict[str, Tensor]:
         if not isinstance(batch, (tuple, list)) or len(batch) < 2:
-            raise ValueError("batch must be a tuple or list whose first two elements are x0 and y")
-
+            raise ValueError("batch must be a tuple or list like (x0, y, ...)")
         x0 = batch[0]
         y = batch[1]
+
         if x0.ndim != 4 or y.ndim != 4:
             raise ValueError(f"x0 and y must be BCHW tensors, got {tuple(x0.shape)} and {tuple(y.shape)}")
         if x0.shape != y.shape:
@@ -83,19 +76,18 @@ class PairWaveletBatchTransform(nn.Module):
     def decompose(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         ll, lh, hl, hh = self.dwt(x)
         if self.wavelet_scale != 1.0:
-            ll = ll * self.wavelet_scale
-            lh = lh * self.wavelet_scale
-            hl = hl * self.wavelet_scale
-            hh = hh * self.wavelet_scale
+            ll = ll / self.wavelet_scale
+            lh = lh / self.wavelet_scale
+            hl = hl / self.wavelet_scale
+            hh = hh / self.wavelet_scale
         return ll, lh, hl, hh
 
     def reconstruct(self, ll: Tensor, lh: Tensor, hl: Tensor, hh: Tensor, output_size=None) -> Tensor:
         if self.wavelet_scale != 1.0:
-            inv_scale = 1.0 / self.wavelet_scale
-            ll = ll * inv_scale
-            lh = lh * inv_scale
-            hl = hl * inv_scale
-            hh = hh * inv_scale
+            ll = ll * self.wavelet_scale
+            lh = lh * self.wavelet_scale
+            hl = hl * self.wavelet_scale
+            hh = hh * self.wavelet_scale
         x = self.iwt(ll, lh, hl, hh)
         return self._match_output_size(x, output_size)
 
@@ -107,13 +99,13 @@ class PairWaveletBatchTransform(nn.Module):
     def unpack_hf(hf: Tensor, base_channels: int | None = None) -> Tuple[Tensor, Tensor, Tensor]:
         if base_channels is None:
             if hf.shape[1] % 3 != 0:
-                raise ValueError(f"HF channels must be divisible by 3, got {hf.shape[1]}")
+                raise ValueError(f"hf channels must be divisible by 3, got {hf.shape[1]}")
             base_channels = hf.shape[1] // 3
         if hf.shape[1] != 3 * base_channels:
             raise ValueError(f"Expected {3 * base_channels} HF channels, got {hf.shape[1]}")
         lh = hf[:, :base_channels]
-        hl = hf[:, base_channels: 2 * base_channels]
-        hh = hf[:, 2 * base_channels: 3 * base_channels]
+        hl = hf[:, base_channels:2 * base_channels]
+        hh = hf[:, 2 * base_channels:3 * base_channels]
         return lh, hl, hh
 
     @staticmethod
@@ -124,14 +116,14 @@ class PairWaveletBatchTransform(nn.Module):
     def unpack_wavelet(wavelet: Tensor, base_channels: int | None = None) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         if base_channels is None:
             if wavelet.shape[1] % 4 != 0:
-                raise ValueError(f"Wavelet channels must be divisible by 4, got {wavelet.shape[1]}")
+                raise ValueError(f"wavelet channels must be divisible by 4, got {wavelet.shape[1]}")
             base_channels = wavelet.shape[1] // 4
         if wavelet.shape[1] != 4 * base_channels:
             raise ValueError(f"Expected {4 * base_channels} wavelet channels, got {wavelet.shape[1]}")
         ll = wavelet[:, :base_channels]
-        lh = wavelet[:, base_channels: 2 * base_channels]
-        hl = wavelet[:, 2 * base_channels: 3 * base_channels]
-        hh = wavelet[:, 3 * base_channels: 4 * base_channels]
+        lh = wavelet[:, base_channels:2 * base_channels]
+        hl = wavelet[:, 2 * base_channels:3 * base_channels]
+        hh = wavelet[:, 3 * base_channels:4 * base_channels]
         return ll, lh, hl, hh
 
     def inverse_from_parts(self, ll: Tensor, lh: Tensor, hl: Tensor, hh: Tensor, output_size=None) -> Tensor:
@@ -156,18 +148,16 @@ class PairWaveletBatchTransform(nn.Module):
             output_size = tuple(int(v) for v in output_size.detach().cpu().flatten().tolist())
         if isinstance(output_size, torch.Size):
             output_size = tuple(output_size)
-        if len(output_size) >= 2:
-            target_h = int(output_size[-2])
-            target_w = int(output_size[-1])
-        else:
+        if len(output_size) < 2:
             raise ValueError(f"output_size must contain height and width, got {output_size}")
 
+        target_h = int(output_size[-2])
+        target_w = int(output_size[-1])
         h, w = x.shape[-2:]
-        if h == target_h and w == target_w:
-            return x
+
         x = x[..., :target_h, :target_w]
         pad_h = max(target_h - x.shape[-2], 0)
         pad_w = max(target_w - x.shape[-1], 0)
         if pad_h > 0 or pad_w > 0:
-            x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h))
+            x = F.pad(x, (0, pad_w, 0, pad_h))
         return x
