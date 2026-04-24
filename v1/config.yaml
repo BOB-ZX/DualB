@@ -41,7 +41,13 @@ model:
   lr_d: 0.0001                          # Learning rate for the discriminator
   disc_grad_penalty_freq: 10            # Frequency of the gradient penalty calculation for the discriminator
   disc_grad_penalty_weight: 0.5         # Gradient penalty weight for the discriminator
-  lambda_rec_loss: 0.5                  # Reconstruction loss weight
+  lambda_rec_loss: 1.0                  # Reconstruction loss weight
+  lambda_adv_loss: 1.0
+  lambda_ll_loss: 1.5
+  lambda_hf_loss: 0.25
+  lambda_img_loss: 1.0
+  lambda_prev_ll_loss: 0.05
+  wavelet_scale: 1.0
   optim_betas: [0.5, 0.9]               # Adam optimizer betas
   eval_mask: True                      # Whether to use mask during test
   eval_subject: True                    # Whether to evaluate subject-wise during test (`subject_ids` should be provided in the test dataset)
@@ -53,12 +59,16 @@ model:
     gamma: 1                            # Gamma value that controls noise in the end-point of the bridge
     n_recursions: 2                     # Max number of recursions (R)
     consistency_threshold: 0.01         # Self-consistency threshold for the recursive step
+    base_channels: 1
+    hf_beta_min: 0.1
+    hf_beta_max: 20.0
+    hf_use_geometric: false
 
   generator_params:
     self_recursion: True                # Whether to use self-consistent recursion
-    image_size: ${data.image_size}      # Image size
+    image_size: 128                     # Image size ${data.image_size}/2
     z_emb_dim: 256                      # Dimension of the latent embedding
-    ch_mult: [1, 1, 2, 2, 4, 4]         # Channel multipliers for each resolution
+    ch_mult: [1, 2, 2, 2, 4]            # Channel multipliers for each resolution
     num_res_blocks: 2                   # Number of residual blocks
     attn_resolutions: [16]              # Resolutions to apply attention
     dropout: 0.0                        # Dropout rate
@@ -70,18 +80,26 @@ model:
     resblock_type: biggan               # Type of the residual block
     progressive: none                   # Whether to use progressive training
     progressive_input: residual         # Type of the input for the progressive training
+    progressive_combine: sum
     embedding_type: positional          # Embedding type
     combine_method: sum                 # Method to combine the skip connection
     fourier_scale: 16                   # Fourier scale
+    patch_size: 1
     nf: 64                              # Number of filters
-    num_channels: 2                     # Number of channels in the input
+    num_channels: 8                      # cat(x_t_wavelet, y_wavelet), single-channel image gives 4+4 channels
+    num_out_channels: 4                 # predicted target wavelet [LL, LH, HL, HH]
     nz: 100                             # Number of latent dimensions
     n_mlp: 3                            # Number of MLP layers
     centered: True                      # Whether to center the input
-    not_use_tanh: False                 # Whether to use tanh activation
+    not_use_tanh: True                 # Whether to use tanh activation
+    num_channels_dae: 64
+    no_use_fbn: false
+    no_use_freq: false
+    no_use_residual: false
+    concat_x_r: false
 
   discriminator_params:
-    nc: 2                               # Number of channels in the input (x_t, x_{t-1})
+    nc: 8                               # Number of channels in the input (x_t, x_{t-1})
     ngf: 32                             # Number of generator filters
     t_emb_dim: 256                      # Dimension of the temporal embedding
 

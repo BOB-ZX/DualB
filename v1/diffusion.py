@@ -1,33 +1,15 @@
-"""
-Hybrid wavelet diffusion for SelfRDB.
-
-Design:
-    LL uses a SelfRDB-style diffusion bridge conditioned on source LL.
-    LH/HL/HH use WaveDiff/DDGAN-style conditional diffusion coefficients.
-
-The code keeps the SelfRDB call pattern:
-    q_sample_mixed_pair(t, x0_wavelet, y_wavelet) -> x_{t-1}, x_t
-    q_posterior(t, x_t, x0_hat, y_wavelet) -> x_{t-1}
-
-Timestep convention in this file:
-    t is sampled from [1, n_steps].
-    LL bridge uses t directly.
-    HF DDGAN uses u = t - 1, which corresponds to WaveDiff's pair x_u, x_{u+1}.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
-import lightning as L
+import torch.nn as nn
 from torch import Tensor
 
 
-def _extract(input_tensor: Tensor, t: Tensor, shape: torch.Size) -> Tensor:
-    out = torch.gather(input_tensor, 0, t)
+def _extract(values: Tensor, t: Tensor, shape: torch.Size) -> Tensor:
+    out = torch.gather(values, 0, t)
     return out.reshape([shape[0]] + [1] * (len(shape) - 1))
 
 
@@ -41,7 +23,7 @@ class HFDiffusionCoefficients:
         beta_min: float = 0.1,
         beta_max: float = 20.0,
         use_geometric: bool = False,
-    ):
+    ) -> None:
         self.n_steps = int(n_steps)
         self.beta_min = float(beta_min)
         self.beta_max = float(beta_max)
@@ -63,8 +45,8 @@ class HFDiffusionCoefficients:
 
     def get_sigma_schedule(self, device: torch.device) -> Tuple[Tensor, Tensor, Tensor]:
         eps_small = 1e-3
-        t = np.arange(0, self.n_steps + 1, dtype=np.float64)
-        t = torch.from_numpy(t / self.n_steps).to(device=device, dtype=torch.float32)
+        t = np.arange(0, self.n_steps + 1, dtype=np.float64) / self.n_steps
+        t = torch.from_numpy(t).to(device=device, dtype=torch.float32)
         t = t * (1.0 - eps_small) + eps_small
         if self.use_geometric:
             var = self.var_func_geometric(t, self.beta_min, self.beta_max)
@@ -99,14 +81,8 @@ class HFPosteriorCoefficients:
         beta_min: float = 0.1,
         beta_max: float = 20.0,
         use_geometric: bool = False,
-    ):
-        tmp = HFDiffusionCoefficients(
-            n_steps=n_steps,
-            device=device,
-            beta_min=beta_min,
-            beta_max=beta_max,
-            use_geometric=use_geometric,
-        )
+    ) -> None:
+        tmp = HFDiffusionCoefficients(n_steps, device, beta_min=beta_min, beta_max=beta_max, use_geometric=use_geometric)
         betas = tmp.get_sigma_schedule(device)[2].float()[1:]
         self.betas = betas
         self.alphas = 1.0 - betas
@@ -127,47 +103,50 @@ class HFPosteriorCoefficients:
         ) * x_up1
         log_var = _extract(self.posterior_log_variance_clipped, u, x_up1.shape)
         noise = torch.randn_like(x_up1)
-        nonzero_mask = (1.0 - (u == 0).float()).view([x_up1.shape[0]] + [1] * (x_up1.ndim - 1))
-        return mean + nonzero_mask * torch.exp(0.5 * log_var) * noise
+        nonzero = (1.0 - (u == 0).float()).view([x_up1.shape[0]] + [1] * (x_up1.ndim - 1))
+        return mean + nonzero * torch.exp(0.5 * log_var) * noise
 
 
-class LLDiffusionBridge(L.LightningModule):
+class LLDiffusionBridge(nn.Module):
     """SelfRDB-style diffusion bridge applied to LL subbands."""
 
     def __init__(
         self,
-        n_steps: int,
-        gamma: float,
-        beta_start: float,
-        beta_end: float,
+        n_steps: int = 10,
+        gamma: float = 1.0,
+        beta_start: float = 1e-4,
+        beta_end: float = 2e-2,
         n_recursions: int = 1,
         consistency_threshold: float = 0.0,
-    ):
+    ) -> None:
         super().__init__()
         if n_steps < 2:
             raise ValueError(f"n_steps must be >= 2, got {n_steps}")
         self.n_steps = int(n_steps)
         self.gamma = float(gamma)
         self.beta_start = float(beta_start)
-        self.beta_end = float(beta_end) / self.n_steps
+        self.beta_end = float(beta_end)
         self.n_recursions = int(n_recursions)
         self.consistency_threshold = float(consistency_threshold)
 
-        betas = self._get_betas()
+        betas = self._get_betas(self.n_steps, self.beta_start, self.beta_end)
         s = np.cumsum(betas) ** 0.5
         s_bar = np.flip(np.cumsum(betas)) ** 0.5
         mu_x0, mu_y, _ = self.gaussian_product(s, s_bar)
         gamma_scaled = self.gamma * betas.sum()
         std = gamma_scaled * s / (s ** 2 + s_bar ** 2)
 
+        self.register_buffer("betas", torch.tensor(betas, dtype=torch.float32))
         self.register_buffer("s", torch.tensor(s, dtype=torch.float32))
         self.register_buffer("mu_x0", torch.tensor(mu_x0, dtype=torch.float32))
         self.register_buffer("mu_y", torch.tensor(mu_y, dtype=torch.float32))
         self.register_buffer("std", torch.tensor(std, dtype=torch.float32))
 
-    def _get_betas(self) -> np.ndarray:
-        betas_len = self.n_steps + 1
-        betas = np.linspace(self.beta_start ** 0.5, self.beta_end ** 0.5, betas_len) ** 2
+    @staticmethod
+    def _get_betas(n_steps: int, beta_start: float, beta_end: float) -> np.ndarray:
+        beta_end = beta_end / n_steps
+        betas_len = n_steps + 1
+        betas = np.linspace(beta_start ** 0.5, beta_end ** 0.5, betas_len) ** 2
         betas = np.append(0.0, betas).astype(np.float32)
         if betas_len % 2 == 1:
             return np.concatenate([betas[: betas_len // 2], [betas[betas_len // 2]], np.flip(betas[: betas_len // 2])])
@@ -186,6 +165,8 @@ class LLDiffusionBridge(L.LightningModule):
         return coeff.view([-1] + [1] * (x.ndim - 1))
 
     def q_sample(self, t: Tensor, x0_ll: Tensor, y_ll: Tensor, noise: Optional[Tensor] = None) -> Tensor:
+        if x0_ll.shape != y_ll.shape:
+            raise ValueError(f"x0_ll and y_ll shape mismatch: {tuple(x0_ll.shape)} vs {tuple(y_ll.shape)}")
         if noise is None:
             noise = torch.randn_like(x0_ll)
         mu_x0 = self._shape(self.mu_x0[t], x0_ll)
@@ -193,7 +174,14 @@ class LLDiffusionBridge(L.LightningModule):
         std = self._shape(self.std[t], x0_ll)
         return mu_x0 * x0_ll + mu_y * y_ll + std * noise
 
-    def q_posterior(self, t: Tensor, x_t_ll: Tensor, x0_hat_ll: Tensor, y_ll: Tensor, noise: Optional[Tensor] = None) -> Tensor:
+    def q_posterior(
+        self,
+        t: Tensor,
+        x_t_ll: Tensor,
+        x0_hat_ll: Tensor,
+        y_ll: Tensor,
+        noise: Optional[Tensor] = None,
+    ) -> Tensor:
         if noise is None:
             noise = torch.randn_like(x_t_ll)
 
@@ -217,22 +205,22 @@ class LLDiffusionBridge(L.LightningModule):
         return mean + torch.sqrt(torch.clamp(v, min=0.0)) * noise
 
 
-class HybridWaveletDiffusion(L.LightningModule):
-    """LL bridge plus HF WaveDiff posterior, packaged for the SelfRDB runner."""
+class HybridWaveletDiffusion(nn.Module):
+    """LL bridge and WaveDiff-style HF diffusion for a full wavelet state."""
 
     def __init__(
         self,
-        n_steps: int,
-        gamma: float,
-        beta_start: float,
-        beta_end: float,
+        n_steps: int = 10,
+        gamma: float = 1.0,
+        beta_start: float = 1e-4,
+        beta_end: float = 2e-2,
         n_recursions: int = 1,
         consistency_threshold: float = 0.0,
         base_channels: int = 1,
         hf_beta_min: float = 0.1,
         hf_beta_max: float = 20.0,
         hf_use_geometric: bool = False,
-    ):
+    ) -> None:
         super().__init__()
         self.n_steps = int(n_steps)
         self.n_recursions = int(n_recursions)
@@ -241,7 +229,6 @@ class HybridWaveletDiffusion(L.LightningModule):
         self.hf_beta_min = float(hf_beta_min)
         self.hf_beta_max = float(hf_beta_max)
         self.hf_use_geometric = bool(hf_use_geometric)
-
         self.ll_bridge = LLDiffusionBridge(
             n_steps=n_steps,
             gamma=gamma,
@@ -250,11 +237,11 @@ class HybridWaveletDiffusion(L.LightningModule):
             n_recursions=n_recursions,
             consistency_threshold=consistency_threshold,
         )
-        self._hf_device = None
-        self._hf_coeff = None
-        self._hf_pos_coeff = None
+        self._hf_device: torch.device | None = None
+        self._hf_coeff: HFDiffusionCoefficients | None = None
+        self._hf_pos_coeff: HFPosteriorCoefficients | None = None
 
-    def _ensure_hf(self, device: torch.device):
+    def _ensure_hf(self, device: torch.device) -> None:
         if self._hf_device == device and self._hf_coeff is not None and self._hf_pos_coeff is not None:
             return
         self._hf_coeff = HFDiffusionCoefficients(
@@ -276,30 +263,32 @@ class HybridWaveletDiffusion(L.LightningModule):
     def split_wavelet(self, wavelet: Tensor) -> Tuple[Tensor, Tensor]:
         c = self.base_channels
         if wavelet.shape[1] != 4 * c:
-            raise ValueError(f"Expected wavelet channels {4 * c}, got {wavelet.shape[1]}")
+            raise ValueError(f"Expected {4 * c} wavelet channels, got {wavelet.shape[1]}")
         return wavelet[:, :c], wavelet[:, c:]
 
-    def merge_wavelet(self, ll: Tensor, hf: Tensor) -> Tensor:
+    @staticmethod
+    def merge_wavelet(ll: Tensor, hf: Tensor) -> Tensor:
         return torch.cat([ll, hf], dim=1)
 
     def q_sample_mixed_pair(self, t: Tensor, x0_wavelet: Tensor, y_wavelet: Tensor) -> Tuple[Tensor, Tensor]:
         self._ensure_hf(x0_wavelet.device)
+        assert self._hf_coeff is not None
         x0_ll, x0_hf = self.split_wavelet(x0_wavelet)
         y_ll, _ = self.split_wavelet(y_wavelet)
         u = t - 1
 
-        x_tm1_ll = self.ll_bridge.q_sample(t - 1, x0_ll, y_ll)
         x_t_ll = self.ll_bridge.q_sample(t, x0_ll, y_ll)
+        x_tm1_ll = self.ll_bridge.q_posterior(t, x_t_ll, x0_ll, y_ll)
         x_tm1_hf, x_t_hf = self._hf_coeff.q_sample_pairs(x0_hf, u)
         return self.merge_wavelet(x_tm1_ll, x_tm1_hf), self.merge_wavelet(x_t_ll, x_t_hf)
 
     def q_posterior(self, t: Tensor, x_t_wavelet: Tensor, x0_hat_wavelet: Tensor, y_wavelet: Tensor) -> Tensor:
         self._ensure_hf(x_t_wavelet.device)
+        assert self._hf_pos_coeff is not None
         x_t_ll, x_t_hf = self.split_wavelet(x_t_wavelet)
         x0_hat_ll, x0_hat_hf = self.split_wavelet(x0_hat_wavelet)
         y_ll, _ = self.split_wavelet(y_wavelet)
         u = t - 1
-
         x_tm1_ll = self.ll_bridge.q_posterior(t, x_t_ll, x0_hat_ll, y_ll)
         x_tm1_hf = self._hf_pos_coeff.sample_posterior(x0_hat_hf, x_t_hf, u)
         return self.merge_wavelet(x_tm1_ll, x_tm1_hf)
@@ -313,21 +302,16 @@ class HybridWaveletDiffusion(L.LightningModule):
         self._ensure_hf(y_wavelet.device)
         y_ll, y_hf = self.split_wavelet(y_wavelet)
         b = y_wavelet.shape[0]
-
-        # LL starts from the bridge endpoint anchored at source LL.
         t_init = torch.full((b,), self.n_steps, device=y_wavelet.device, dtype=torch.long)
         x_t_ll = self.ll_bridge.q_sample(t_init, torch.zeros_like(y_ll), y_ll)
-
-        # HF follows WaveDiff/DDGAN sampling and starts from Gaussian noise.
         x_t_hf = torch.randn_like(y_hf)
         x_t = self.merge_wavelet(x_t_ll, x_t_hf)
         pred = torch.zeros_like(y_wavelet)
-
         for step in range(self.n_steps, 0, -1):
             t = torch.full((b,), step, device=y_wavelet.device, dtype=torch.long)
             pred = predict_x0_fn(x_t, y_wavelet, t)
             x_t = self.q_posterior(t, x_t, pred, y_wavelet).detach()
         return pred
 
-# Backward-compatible alias if older configs import DiffusionBridge.
+
 DiffusionBridge = HybridWaveletDiffusion
