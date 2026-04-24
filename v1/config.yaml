@@ -19,7 +19,7 @@ trainer:
 
     - class_path: ModelCheckpoint
       init_args:
-        every_n_epochs: 10
+        every_n_epochs: 5
         save_on_train_epoch_end: True
         save_top_k: -1
 
@@ -115,6 +115,6 @@ data:
   image_size: 256                       # Image size used in padding
   padding: True                         # Whether to pad the input
   norm: True                            # Whether to normalize the input
-  num_workers: 32
+  num_workers: 24
 
 ckpt_path:

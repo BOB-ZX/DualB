@@ -142,7 +142,7 @@ class BridgeRunner(L.LightningModule):
         t = torch.randint(1, self.n_steps + 1, (x0_wavelet.shape[0],), device=x0_wavelet.device)
         x_prev_real, x_t = self.diffusion.q_sample_mixed_pair(t, x0_wavelet, y_wavelet)
         x_t_for_gp = x_t.detach().requires_grad_(True)
-        disc_real = self.discriminator(x_prev_real.detach(), x_t_for_gp, t)
+        disc_real = self.discriminator(x_prev_real.detach(), t, x_t_for_gp)
         d_real_loss = self.adversarial_loss(disc_real, is_real=True)
         d_real_acc = (disc_real > 0).float().mean()
 
@@ -157,7 +157,7 @@ class BridgeRunner(L.LightningModule):
             x0_pred_detached = self._predict_wavelet_x0(x_t, y_wavelet, t).detach()
             x_prev_fake = self.diffusion.q_posterior(t, x_t, x0_pred_detached, y_wavelet)
 
-        disc_fake = self.discriminator(x_prev_fake.detach(), x_t.detach(), t)
+        disc_fake = self.discriminator(x_prev_fake.detach(), t, x_t.detach())
         d_fake_loss = self.adversarial_loss(disc_fake, is_real=False)
         d_fake_acc = (disc_fake < 0).float().mean()
         d_loss = d_real_loss + d_fake_loss
@@ -181,7 +181,7 @@ class BridgeRunner(L.LightningModule):
         real_prev_ll, _ = self._split(x_prev_real)
         pred_img = self._inverse_wavelet(x0_pred, out_size)
 
-        adv_loss = self.adversarial_loss(self.discriminator(x_prev_fake, x_t.detach(), t), is_real=True)
+        adv_loss = self.adversarial_loss(self.discriminator(x_prev_fake, t, x_t.detach()), is_real=True)
         wave_rec_loss = F.l1_loss(x0_pred, x0_wavelet, reduction="mean")
         ll_loss = F.l1_loss(pred_ll, gt_ll, reduction="mean")
         hf_loss = F.l1_loss(pred_hf, gt_hf, reduction="mean")
