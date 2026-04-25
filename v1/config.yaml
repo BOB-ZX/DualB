@@ -40,9 +40,9 @@ model:
   lr_g: 0.00016                         # Learning rate for the generator
   lr_d: 0.0001                          # Learning rate for the discriminator
   disc_grad_penalty_freq: 10            # Frequency of the gradient penalty calculation for the discriminator
-  disc_grad_penalty_weight: 0.1         # Gradient penalty weight for the discriminator
+  disc_grad_penalty_weight: 0.0         # Gradient penalty weight for the discriminator
   lambda_rec_loss: 0.25                  # Reconstruction loss weight
-  lambda_adv_loss: 1.0
+  lambda_adv_loss: 0.001
   lambda_ll_loss: 0.5
   lambda_hf_loss: 0.25
   lambda_img_loss: 0.5
@@ -99,8 +99,8 @@ model:
     concat_x_r: True
 
   discriminator_params:
-    nc: 8                               # Number of channels in the input (x_t, x_{t-1})
-    ngf: 64                             # Number of generator filters
+    nc: 2                               # Number of channels in the input (x_t, x_{t-1})
+    ngf: 32                             # Number of generator filters
     t_emb_dim: 256                      # Dimension of the temporal embedding
 
 data:

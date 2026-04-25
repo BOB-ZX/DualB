@@ -76,7 +76,7 @@ class BridgeRunner(L.LightningModule):
         generator_params = dict(generator_params)
         use_recursive_state = bool(generator_params.get("concat_x_r", False))
         generator_params["num_channels"] = (3 if use_recursive_state else 2) * self.wavelet_channels
-        generator_params["num_out_channels"] = self.wavelet_channels
+        generator_params["num_out_channels"] = (3 if use_recursive_state else 2) * self.wavelet_channels
         self.latent_dim = int(latent_dim or generator_params.get("nz", 100))
         self.generator = WaveDiffNCSNpp(**generator_params)
 
@@ -109,10 +109,10 @@ class BridgeRunner(L.LightningModule):
         gen_input = torch.cat([x_t_wavelet.detach(), y_wavelet], dim=1)
         x0_r = torch.zeros_like(x_t_wavelet)
         pred = x0_r
-        z = self._latent(x_t_wavelet.shape[0], x_t_wavelet.device, x_t_wavelet.dtype)
+        # z = self._latent(x_t_wavelet.shape[0], x_t_wavelet.device, x_t_wavelet.dtype)
 
         for _ in range(max(self.n_recursions, 1)):
-            pred_next = self.generator(gen_input, t, z=z, x_r=x0_r)
+            pred_next = self.generator(gen_input, t, x_r=x0_r)
             if self.consistency_threshold > 0.0:
                 change = torch.abs(pred_next - x0_r).mean(dim=(1, 2, 3)).max()
                 x0_r = pred_next
@@ -134,24 +134,46 @@ class BridgeRunner(L.LightningModule):
     def training_step(self, batch, batch_idx=None):
         x0, _, _ = batch
         optimizer_g, optimizer_d = self.optimizers()
+
         out = self.wavelet_transform(batch)
         x0_wavelet = out["x0_wavelet"]
         y_wavelet = out["y_wavelet"]
         out_size = x0.shape[-2:]
 
+        # =========================
+        # 1. Train D, LL only
+        # =========================
         self.toggle_optimizer(optimizer_d)
         optimizer_d.zero_grad(set_to_none=True)
 
-        t = torch.randint(1, self.n_steps + 1, (x0_wavelet.shape[0],), device=x0_wavelet.device)
+        t = torch.randint(
+            1, self.n_steps + 1,
+            (x0_wavelet.shape[0],),
+            device=x0_wavelet.device
+        )
+
         x_prev_real, x_t = self.diffusion.q_sample_mixed_pair(t, x0_wavelet, y_wavelet)
-        x_t_for_gp = x_t.detach().requires_grad_(True)
-        disc_real = self.discriminator(x_prev_real.detach(), t, x_t_for_gp)
+
+        x_tm1_real_ll, _ = self.diffusion.split_wavelet(x_prev_real)
+        x_t_real_ll, _ = self.diffusion.split_wavelet(x_t)
+
+        x_t_ll_for_gp = x_t_real_ll.detach().requires_grad_(True)
+
+        disc_real = self.discriminator(
+            x_tm1_real_ll.detach(),
+            t,
+            x_t_ll_for_gp
+        )
         d_real_loss = self.adversarial_loss(disc_real, is_real=True)
         d_real_acc = (disc_real > 0).float().mean()
 
         gp_loss = torch.tensor(0.0, device=x0.device)
         if self.disc_grad_penalty_freq > 0 and self.global_step % self.disc_grad_penalty_freq == 0:
-            grads = torch.autograd.grad(outputs=disc_real.sum(), inputs=x_t_for_gp, create_graph=True)[0]
+            grads = torch.autograd.grad(
+                outputs=disc_real.sum(),
+                inputs=x_t_ll_for_gp,
+                create_graph=True
+            )[0]
             gp_loss = grads.view(grads.size(0), -1).norm(2, dim=1).pow(2).mean()
             gp_loss = gp_loss * self.disc_grad_penalty_weight
             d_real_loss = d_real_loss + gp_loss
@@ -159,10 +181,16 @@ class BridgeRunner(L.LightningModule):
         with torch.no_grad():
             x0_pred_detached = self._predict_wavelet_x0(x_t, y_wavelet, t).detach()
             x_prev_fake = self.diffusion.q_posterior(t, x_t, x0_pred_detached, y_wavelet)
+            x_tm1_fake_ll, _ = self.diffusion.split_wavelet(x_prev_fake)
 
-        disc_fake = self.discriminator(x_prev_fake.detach(), t, x_t.detach())
+        disc_fake = self.discriminator(
+            x_tm1_fake_ll.detach(),
+            t,
+            x_t_real_ll.detach()
+        )
         d_fake_loss = self.adversarial_loss(disc_fake, is_real=False)
         d_fake_acc = (disc_fake < 0).float().mean()
+
         d_loss = d_real_loss + d_fake_loss
         d_acc = 0.5 * (d_real_acc + d_fake_acc)
 
@@ -170,21 +198,36 @@ class BridgeRunner(L.LightningModule):
         optimizer_d.step()
         self.untoggle_optimizer(optimizer_d)
 
+        # =========================
+        # 2. Train G
+        # =========================
         self.toggle_optimizer(optimizer_g)
         optimizer_g.zero_grad(set_to_none=True)
 
-        t = torch.randint(1, self.n_steps + 1, (x0_wavelet.shape[0],), device=x0_wavelet.device)
+        t = torch.randint(
+            1, self.n_steps + 1,
+            (x0_wavelet.shape[0],),
+            device=x0_wavelet.device
+        )
+
         x_prev_real, x_t = self.diffusion.q_sample_mixed_pair(t, x0_wavelet, y_wavelet)
         x0_pred = self._predict_wavelet_x0(x_t, y_wavelet, t)
         x_prev_fake = self.diffusion.q_posterior(t, x_t, x0_pred, y_wavelet)
 
         pred_ll, pred_hf = self._split(x0_pred)
         gt_ll, gt_hf = self._split(x0_wavelet)
+
         fake_prev_ll, _ = self._split(x_prev_fake)
         real_prev_ll, _ = self._split(x_prev_real)
+        x_t_ll, _ = self._split(x_t)
+
         pred_img = self._inverse_wavelet(x0_pred, out_size)
 
-        adv_loss = self.adversarial_loss(self.discriminator(x_prev_fake, t, x_t.detach()), is_real=True)
+        adv_loss = self.adversarial_loss(
+            self.discriminator(fake_prev_ll, t, x_t_ll.detach()),
+            is_real=True
+        )
+
         wave_rec_loss = F.l1_loss(x0_pred, x0_wavelet, reduction="mean")
         ll_loss = F.l1_loss(pred_ll, gt_ll, reduction="mean")
         hf_loss = F.l1_loss(pred_hf, gt_hf, reduction="mean")
@@ -204,11 +247,19 @@ class BridgeRunner(L.LightningModule):
         optimizer_g.step()
         self.untoggle_optimizer(optimizer_g)
 
+        # =========================
+        # 3. Logging
+        # =========================
         self.log("d_loss/real", d_real_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("d_loss/fake", d_fake_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("d_loss/gp", gp_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("d_loss/total", d_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("d_acc", d_acc.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("d_acc/real", d_real_acc.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("d_acc/fake", d_fake_acc.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("d_logit/real_mean", disc_real.detach().mean(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("d_logit/fake_mean", disc_fake.detach().mean(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+
         self.log("g_loss/adv", adv_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("g_loss/wave", wave_rec_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("g_loss/ll", ll_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
