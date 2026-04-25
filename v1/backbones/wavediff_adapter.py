@@ -65,7 +65,7 @@ class WaveDiffNCSNppAdapter(nn.Module):
         if self.concat_x_r:
             if x_r is None:
                 raise ValueError("concat_x_r=True requires x_r")
-            x = torch.cat([x, x_r], dim=1)
+            x = torch.cat([x_r, x], dim=1)
 
         if z is None:
             z = torch.randn(x.shape[0], self.nz, device=x.device, dtype=x.dtype)
