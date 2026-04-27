@@ -132,9 +132,8 @@ class BridgeRunner(L.LightningModule):
         ).clamp(-1.0, 1.0)
 
     def training_step(self, batch, batch_idx=None):
-        x0, _, _ = batch
+        x0, y, _ = batch # [bs, 1, 256, 256]
         optimizer_g, optimizer_d = self.optimizers()
-
         out = self.wavelet_transform(batch)
         x0_wavelet = out["x0_wavelet"]
         y_wavelet = out["y_wavelet"]
@@ -157,12 +156,12 @@ class BridgeRunner(L.LightningModule):
         x_tm1_real_ll, _ = self.diffusion.split_wavelet(x_prev_real)
         x_t_real_ll, _ = self.diffusion.split_wavelet(x_t)
 
-        x_t_ll_for_gp = x_t_real_ll.detach().requires_grad_(True)
+        x_t_real_ll.requires_grad = True
 
         disc_real = self.discriminator(
-            x_tm1_real_ll.detach(),
+            x_tm1_real_ll,
             t,
-            x_t_ll_for_gp
+            x_t_real_ll
         )
         d_real_loss = self.adversarial_loss(disc_real, is_real=True)
         d_real_acc = (disc_real > 0).float().mean()
@@ -171,7 +170,7 @@ class BridgeRunner(L.LightningModule):
         if self.disc_grad_penalty_freq > 0 and self.global_step % self.disc_grad_penalty_freq == 0:
             grads = torch.autograd.grad(
                 outputs=disc_real.sum(),
-                inputs=x_t_ll_for_gp,
+                inputs=x_t_real_ll,
                 create_graph=True
             )[0]
             gp_loss = grads.view(grads.size(0), -1).norm(2, dim=1).pow(2).mean()
@@ -192,17 +191,18 @@ class BridgeRunner(L.LightningModule):
         d_fake_acc = (disc_fake < 0).float().mean()
 
         d_loss = d_real_loss + d_fake_loss
+        # d_loss = d_loss * 0.15
         d_acc = 0.5 * (d_real_acc + d_fake_acc)
 
         self.manual_backward(d_loss)
         optimizer_d.step()
+        optimizer_d.zero_grad()
         self.untoggle_optimizer(optimizer_d)
 
         # =========================
         # 2. Train G
         # =========================
         self.toggle_optimizer(optimizer_g)
-        optimizer_g.zero_grad(set_to_none=True)
 
         t = torch.randint(
             1, self.n_steps + 1,
@@ -214,13 +214,9 @@ class BridgeRunner(L.LightningModule):
         x0_pred = self._predict_wavelet_x0(x_t, y_wavelet, t)
         x_prev_fake = self.diffusion.q_posterior(t, x_t, x0_pred, y_wavelet)
 
-        pred_ll, pred_hf = self._split(x0_pred)
-        gt_ll, gt_hf = self._split(x0_wavelet)
-
         fake_prev_ll, _ = self._split(x_prev_fake)
-        real_prev_ll, _ = self._split(x_prev_real)
         x_t_ll, _ = self._split(x_t)
-
+        
         pred_img = self._inverse_wavelet(x0_pred, out_size)
 
         adv_loss = self.adversarial_loss(
@@ -228,21 +224,15 @@ class BridgeRunner(L.LightningModule):
             is_real=True
         )
 
-        wave_rec_loss = F.l1_loss(x0_pred, x0_wavelet, reduction="mean")
-        ll_loss = F.l1_loss(pred_ll, gt_ll, reduction="mean")
-        hf_loss = F.l1_loss(pred_hf, gt_hf, reduction="mean")
-        img_loss = F.l1_loss(pred_img, x0, reduction="mean")
-        prev_ll_loss = F.l1_loss(fake_prev_ll, real_prev_ll.detach(), reduction="mean")
+        rec_loss = F.l1_loss(pred_img, x0, reduction="mean")
+
 
         g_loss = (
             self.lambda_adv_loss * adv_loss
-            + self.lambda_rec_loss * wave_rec_loss
-            + self.lambda_ll_loss * ll_loss
-            + self.lambda_hf_loss * hf_loss
-            + self.lambda_img_loss * img_loss
-            + self.lambda_prev_ll_loss * prev_ll_loss
+            + self.lambda_img_loss * rec_loss
         )
 
+        
         self.manual_backward(g_loss)
         optimizer_g.step()
         self.untoggle_optimizer(optimizer_g)
@@ -261,11 +251,7 @@ class BridgeRunner(L.LightningModule):
         self.log("d_logit/fake_mean", disc_fake.detach().mean(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         self.log("g_loss/adv", adv_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log("g_loss/wave", wave_rec_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("g_loss/ll", ll_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("g_loss/hf", hf_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log("g_loss/img", img_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("g_loss/prev_ll", prev_ll_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("g_loss/rec", rec_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("g_loss/total", g_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
     @torch.inference_mode()

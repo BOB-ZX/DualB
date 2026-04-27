@@ -40,13 +40,13 @@ model:
   lr_g: 0.00016                         # Learning rate for the generator
   lr_d: 0.0001                          # Learning rate for the discriminator
   disc_grad_penalty_freq: 10            # Frequency of the gradient penalty calculation for the discriminator
-  disc_grad_penalty_weight: 0.0         # Gradient penalty weight for the discriminator
-  lambda_rec_loss: 0.25                  # Reconstruction loss weight
-  lambda_adv_loss: 0.001
-  lambda_ll_loss: 0.5
-  lambda_hf_loss: 0.25
-  lambda_img_loss: 0.5
-  lambda_prev_ll_loss: 0.05
+  disc_grad_penalty_weight: 0.05         # Gradient penalty weight for the discriminator
+  lambda_rec_loss: 1.0                  # Reconstruction loss weight
+  lambda_adv_loss: 1.0
+  lambda_ll_loss: 0.00
+  lambda_hf_loss: 0.00
+  lambda_img_loss: 0.75
+  lambda_prev_ll_loss: 0.00
   wavelet_scale: 2.0
   optim_betas: [0.5, 0.9]               # Adam optimizer betas
   eval_mask: True                      # Whether to use mask during test
