@@ -43,8 +43,6 @@ class BridgeRunner(L.LightningModule):
         lambda_adv_loss: float = 1.0,
         lambda_ll_loss: float = 1.0,
         lambda_hf_loss: float = 0.5,
-        lambda_img_loss: float = 1.0,
-        lambda_prev_ll_loss: float = 0.1,
         wavelet_scale: float = 1.0,
         latent_dim: int | None = None,
     ) -> None:
@@ -60,8 +58,6 @@ class BridgeRunner(L.LightningModule):
         self.lambda_adv_loss = float(lambda_adv_loss)
         self.lambda_ll_loss = float(lambda_ll_loss)
         self.lambda_hf_loss = float(lambda_hf_loss)
-        self.lambda_img_loss = float(lambda_img_loss)
-        self.lambda_prev_ll_loss = float(lambda_prev_ll_loss)
         self.optim_betas = tuple(optim_betas)
         self.eval_mask = bool(eval_mask)
         self.eval_subject = bool(eval_subject)
@@ -152,17 +148,10 @@ class BridgeRunner(L.LightningModule):
         )
 
         x_prev_real, x_t = self.diffusion.q_sample_mixed_pair(t, x0_wavelet, y_wavelet)
-
-        x_tm1_real_ll, _ = self.diffusion.split_wavelet(x_prev_real)
-        x_t_real_ll, _ = self.diffusion.split_wavelet(x_t)
-
-        x_t_real_ll.requires_grad = True
-
-        disc_real = self.discriminator(
-            x_tm1_real_ll,
-            t,
-            x_t_real_ll
-        )
+        x_prev_real_for_d = x_prev_real.detach().requires_grad_(True)
+        x_t_cond = x_t.detach()
+        disc_real = self.discriminator(x_prev_real_for_d, t, x_t_cond)
+        
         d_real_loss = self.adversarial_loss(disc_real, is_real=True)
         d_real_acc = (disc_real > 0).float().mean()
 
@@ -170,29 +159,24 @@ class BridgeRunner(L.LightningModule):
         if self.disc_grad_penalty_freq > 0 and self.global_step % self.disc_grad_penalty_freq == 0:
             grads = torch.autograd.grad(
                 outputs=disc_real.sum(),
-                inputs=x_t_real_ll,
+                inputs=x_prev_real_for_d,
                 create_graph=True
             )[0]
             gp_loss = grads.view(grads.size(0), -1).norm(2, dim=1).pow(2).mean()
-            gp_loss = gp_loss * self.disc_grad_penalty_weight
+            gp_loss = 0.5 * self.disc_grad_penalty_weight * gp_loss
             d_real_loss = d_real_loss + gp_loss
 
         with torch.no_grad():
             x0_pred_detached = self._predict_wavelet_x0(x_t, y_wavelet, t).detach()
             x_prev_fake = self.diffusion.q_posterior(t, x_t, x0_pred_detached, y_wavelet)
-            x_tm1_fake_ll, _ = self.diffusion.split_wavelet(x_prev_fake)
 
-        disc_fake = self.discriminator(
-            x_tm1_fake_ll.detach(),
-            t,
-            x_t_real_ll.detach()
-        )
+        disc_fake = self.discriminator(x_prev_fake.detach(), t, x_t_cond)
         d_fake_loss = self.adversarial_loss(disc_fake, is_real=False)
         d_fake_acc = (disc_fake < 0).float().mean()
 
         d_loss = d_real_loss + d_fake_loss
-        # d_loss = d_loss * 0.15
         d_acc = 0.5 * (d_real_acc + d_fake_acc)
+        d_loss = d_loss*1.0
 
         self.manual_backward(d_loss)
         optimizer_d.step()
@@ -203,7 +187,8 @@ class BridgeRunner(L.LightningModule):
         # 2. Train G
         # =========================
         self.toggle_optimizer(optimizer_g)
-
+        optimizer_g.zero_grad(set_to_none=True)
+        
         t = torch.randint(
             1, self.n_steps + 1,
             (x0_wavelet.shape[0],),
@@ -214,22 +199,27 @@ class BridgeRunner(L.LightningModule):
         x0_pred = self._predict_wavelet_x0(x_t, y_wavelet, t)
         x_prev_fake = self.diffusion.q_posterior(t, x_t, x0_pred, y_wavelet)
 
-        fake_prev_ll, _ = self._split(x_prev_fake)
-        x_t_ll, _ = self._split(x_t)
-        
         pred_img = self._inverse_wavelet(x0_pred, out_size)
 
         adv_loss = self.adversarial_loss(
-            self.discriminator(fake_prev_ll, t, x_t_ll.detach()),
+            self.discriminator(x_prev_fake, t, x_t.detach()),
             is_real=True
         )
+        c = self.base_channels
 
-        rec_loss = F.l1_loss(pred_img, x0, reduction="mean")
+        # ll_rec_loss = F.l1_loss(x0_pred[:, :c], x0_wavelet[:, :c], reduction="sum")
+        # hf_rec_loss = F.l1_loss(x0_pred[:, c:], x0_wavelet[:, c:], reduction="sum")
+        ll_rec_loss = F.l1_loss(x0_pred[:, :c], x0_wavelet[:, :c], reduction="mean")
+        hf_rec_loss = F.l1_loss(x0_pred[:, c:], x0_wavelet[:, c:], reduction="mean")
 
+        rec_loss = (
+            self.lambda_ll_loss * ll_rec_loss
+            + self.lambda_hf_loss * hf_rec_loss
+        )
 
         g_loss = (
             self.lambda_adv_loss * adv_loss
-            + self.lambda_img_loss * rec_loss
+            + self.lambda_rec_loss * rec_loss
         )
 
         
@@ -245,12 +235,16 @@ class BridgeRunner(L.LightningModule):
         self.log("d_loss/gp", gp_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("d_loss/total", d_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("d_acc", d_acc.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("d_acc/real", d_real_acc.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log("d_acc/fake", d_fake_acc.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("d_acc/real", d_real_acc.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("d_acc/fake", d_fake_acc.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("d_logit/real_mean", disc_real.detach().mean(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("d_logit/fake_mean", disc_fake.detach().mean(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
-        self.log("g_loss/adv", adv_loss.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("g_loss/adv", adv_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("g_loss/ll_rec", ll_rec_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("g_loss/hf_rec", hf_rec_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("g_loss/adv_weighted", (self.lambda_adv_loss * adv_loss).detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("g_loss/rec_weighted", (self.lambda_rec_loss * rec_loss).detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("g_loss/rec", rec_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("g_loss/total", g_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
