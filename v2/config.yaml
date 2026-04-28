@@ -45,6 +45,11 @@ model:
   lambda_adv_loss: 0.5
   lambda_ll_loss: 1.0
   lambda_hf_loss: 1.0
+  lambda_aux_loss: 0.25
+  lambda_aux_ll_loss: 1.0
+  lambda_aux_hf_loss: 1.0
+  lambda_aux_delta_loss: 1.0
+  aux_level_weights: null
   wavelet_scale: 2.0
   optim_betas: [0.5, 0.9]               # Adam optimizer betas
   eval_mask: True                      # Whether to use mask during test
@@ -95,6 +100,10 @@ model:
     no_use_freq: false
     no_use_residual: false
     concat_x_r: True
+    deep_supervision: True
+    use_cgfsi: true
+    cgfsi_use_edge_gate: true
+    cgfsi_init_gamma: 0.0
 
   discriminator_params:
     nc: 8                               # Number of channels in the input (x_t, x_{t-1})

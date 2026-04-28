@@ -43,6 +43,12 @@ class BridgeRunner(L.LightningModule):
         lambda_adv_loss: float = 1.0,
         lambda_ll_loss: float = 1.0,
         lambda_hf_loss: float = 0.5,
+        # Multi-scale decoder auxiliary loss.
+        lambda_aux_loss: float = 0.25,
+        lambda_aux_ll_loss: float | None = None,
+        lambda_aux_hf_loss: float | None = None,
+        lambda_aux_delta_loss: float = 1.0,
+        aux_level_weights: list[float] | None = None,
         wavelet_scale: float = 1.0,
         latent_dim: int | None = None,
     ) -> None:
@@ -58,6 +64,11 @@ class BridgeRunner(L.LightningModule):
         self.lambda_adv_loss = float(lambda_adv_loss)
         self.lambda_ll_loss = float(lambda_ll_loss)
         self.lambda_hf_loss = float(lambda_hf_loss)
+        self.lambda_aux_loss = float(lambda_aux_loss)
+        self.lambda_aux_ll_loss = float(lambda_aux_ll_loss if lambda_aux_ll_loss is not None else lambda_ll_loss)
+        self.lambda_aux_hf_loss = float(lambda_aux_hf_loss if lambda_aux_hf_loss is not None else lambda_hf_loss)
+        self.lambda_aux_delta_loss = float(lambda_aux_delta_loss)
+        self.aux_level_weights = list(aux_level_weights) if aux_level_weights is not None else None
         self.optim_betas = tuple(optim_betas)
         self.eval_mask = bool(eval_mask)
         self.eval_subject = bool(eval_subject)
@@ -100,24 +111,123 @@ class BridgeRunner(L.LightningModule):
     def _split(self, wavelet: Tensor) -> Tuple[Tensor, Tensor]:
         c = self.base_channels
         return wavelet[:, :c], wavelet[:, c:]
+    @staticmethod
+    def _resize_like(src: Tensor, ref: Tensor) -> Tensor:
+        if src.shape[-2:] == ref.shape[-2:]:
+            return src
+        return F.interpolate(src, size=ref.shape[-2:], mode="area")
 
-    def _predict_wavelet_x0(self, x_t_wavelet: Tensor, y_wavelet: Tensor, t: Tensor) -> Tensor:
+
+    def _aux_weights(self, n_levels: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        if self.aux_level_weights is not None and len(self.aux_level_weights) == n_levels:
+            weights = torch.tensor(self.aux_level_weights, device=device, dtype=dtype)
+        else:
+            # Coarse -> fine. Later/finer decoder levels get larger weights.
+            weights = torch.arange(1, n_levels + 1, device=device, dtype=dtype)
+
+        weights = weights / weights.sum().clamp_min(1e-8)
+        return weights
+
+
+    def _aux_wavelet_loss(
+        self,
+        aux_preds: list[Tensor],
+        x0_wavelet: Tensor,
+        y_wavelet: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if len(aux_preds) == 0:
+            return x0_wavelet.new_tensor(0.0), {}
+
+        c = self.base_channels
+        weights = self._aux_weights(
+            n_levels=len(aux_preds),
+            device=x0_wavelet.device,
+            dtype=x0_wavelet.dtype,
+        )
+
+        total = x0_wavelet.new_tensor(0.0)
+        logs: dict[str, Tensor] = {}
+
+        for i, aux in enumerate(aux_preds):
+            # Aux head may output more channels when concat_x_r=True before adapter crop.
+            # Keep only predicted target wavelet [LL, LH, HL, HH].
+            aux = aux[:, : self.wavelet_channels, :, :]
+
+            target = self._resize_like(x0_wavelet, aux)
+            cond = self._resize_like(y_wavelet, aux)
+
+            aux_ll = aux[:, :c]
+            aux_hf = aux[:, c:]
+
+            target_ll = target[:, :c]
+            target_hf = target[:, c:]
+
+            cond_hf = cond[:, c:]
+
+            # 1) this layer should predict reasonable LL.
+            ll_l = F.l1_loss(aux_ll, target_ll, reduction="mean")
+
+            # 2) this layer should predict reasonable HF.
+            hf_l = F.l1_loss(aux_hf, target_hf, reduction="mean")
+
+            # 3) this layer should learn the HF change from y -> x0.
+            delta_l = F.l1_loss(
+                aux_hf - cond_hf,
+                target_hf - cond_hf,
+                reduction="mean",
+            )
+
+            level_loss = (
+                self.lambda_aux_ll_loss * ll_l
+                + self.lambda_aux_hf_loss * hf_l
+                + self.lambda_aux_delta_loss * delta_l
+            )
+
+            total = total + weights[i] * level_loss
+
+            logs[f"g_loss/aux_l{i}_ll"] = ll_l.detach()
+            logs[f"g_loss/aux_l{i}_hf"] = hf_l.detach()
+            logs[f"g_loss/aux_l{i}_delta"] = delta_l.detach()
+            logs[f"g_loss/aux_l{i}_total"] = level_loss.detach()
+
+        return total, logs
+    def _predict_wavelet_x0(
+        self,
+        x_t_wavelet: Tensor,
+        y_wavelet: Tensor,
+        t: Tensor,
+        return_aux: bool = False,
+    ):
         gen_input = torch.cat([x_t_wavelet.detach(), y_wavelet], dim=1)
+
         x0_r = torch.zeros_like(x_t_wavelet)
         pred = x0_r
-        # z = self._latent(x_t_wavelet.shape[0], x_t_wavelet.device, x_t_wavelet.dtype)
+        pred_aux: list[Tensor] = []
 
         for _ in range(max(self.n_recursions, 1)):
-            pred_next = self.generator(gen_input, t, x_r=x0_r)
+            if return_aux:
+                pred_next, aux_next = self.generator(gen_input, t, x_r=x0_r, return_aux=True, cond_wavelet=y_wavelet,)
+            else:
+                pred_next = self.generator(gen_input, t, x_r=x0_r)
+                aux_next = []
+
             if self.consistency_threshold > 0.0:
                 change = torch.abs(pred_next - x0_r).mean(dim=(1, 2, 3)).max()
+
                 x0_r = pred_next
                 pred = pred_next
+                pred_aux = aux_next
+
                 if change < self.consistency_threshold:
                     break
             else:
                 x0_r = pred_next
                 pred = pred_next
+                pred_aux = aux_next
+
+        if return_aux:
+            return pred, pred_aux
+
         return pred
 
     def _inverse_wavelet(self, wavelet: Tensor, out_size) -> Tensor:
@@ -196,7 +306,8 @@ class BridgeRunner(L.LightningModule):
         )
 
         x_prev_real, x_t = self.diffusion.q_sample_mixed_pair(t, x0_wavelet, y_wavelet)
-        x0_pred = self._predict_wavelet_x0(x_t, y_wavelet, t)
+        x0_pred, aux_preds = self._predict_wavelet_x0(x_t,y_wavelet,t,return_aux=True,)
+
         x_prev_fake = self.diffusion.q_posterior(t, x_t, x0_pred, y_wavelet)
 
         pred_img = self._inverse_wavelet(x0_pred, out_size)
@@ -216,10 +327,12 @@ class BridgeRunner(L.LightningModule):
             self.lambda_ll_loss * ll_rec_loss
             + self.lambda_hf_loss * hf_rec_loss
         )
+        aux_loss, aux_logs = self._aux_wavelet_loss(aux_preds=aux_preds,x0_wavelet=x0_wavelet,y_wavelet=y_wavelet,)
 
         g_loss = (
             self.lambda_adv_loss * adv_loss
             + self.lambda_rec_loss * rec_loss
+            + self.lambda_aux_loss * aux_loss
         )
 
         
@@ -246,6 +359,10 @@ class BridgeRunner(L.LightningModule):
         self.log("g_loss/adv_weighted", (self.lambda_adv_loss * adv_loss).detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("g_loss/rec_weighted", (self.lambda_rec_loss * rec_loss).detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("g_loss/rec", rec_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("g_loss/aux", aux_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("g_loss/aux_weighted",(self.lambda_aux_loss * aux_loss).detach(),on_step=True,on_epoch=True,prog_bar=True,sync_dist=True,)
+        for name, value in aux_logs.items():
+            self.log(name, value, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("g_loss/total", g_loss.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
     @torch.inference_mode()

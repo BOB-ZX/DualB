@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from .ncsnpp_generator_adagn import WaveletNCSNpp
-
+from typing import Optional, List
 
 class WaveDiffNCSNppAdapter(nn.Module):
     """Thin SelfRDB-compatible wrapper around WaveDiff official WaveletNCSNpp.
@@ -57,36 +57,63 @@ class WaveDiffNCSNppAdapter(nn.Module):
             "no_use_freq": False,
             "no_use_residual": False,
             "concat_x_r": False,
+            "deep_supervision": True,
+            "use_cgfsi": True,
+            "cgfsi_use_edge_gate": True,
+            "cgfsi_init_gamma": 0.0
         }
         defaults.update(kwargs)
-        print("num_out_channels",defaults["num_out_channels"])
-        print("num_channels",defaults["num_channels"])
+        #print("num_out_channels",defaults["num_out_channels"])
+        #print("num_channels",defaults["num_channels"])
         return SimpleNamespace(**defaults)
 
-    def forward(self, x: Tensor, t: Tensor, z: Tensor | None = None, x_r: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        t: Tensor,
+        z: Optional[Tensor] = None,
+        x_r: Optional[Tensor] = None,
+        return_aux: bool = False,
+        cond_wavelet: Optional[Tensor] = None,
+    ) -> Tensor:
+        crop_ch = None
+
         if self.concat_x_r:
             if x_r is None:
                 raise ValueError("concat_x_r=True requires x_r")
-            x = torch.cat([x_r,x], dim=1)
+
+            crop_ch = x_r.shape[1]
+            x = torch.cat([x_r, x], dim=1)
 
         if z is None:
             z = torch.randn(x.shape[0], self.nz, device=x.device, dtype=x.dtype)
+
         if t.ndim != 1:
             t = t.reshape(x.shape[0])
 
         if self.config.embedding_type == "fourier":
             time_cond = t.to(device=x.device, dtype=x.dtype)
-            time_cond = torch.clamp(time_cond, min=1).div(float(max(getattr(self.config, "num_timesteps", 1000), 1)))
+            time_cond = torch.clamp(time_cond, min=1).div(
+                float(max(getattr(self.config, "num_timesteps", 1000), 1))
+            )
         else:
             time_cond = t.to(device=x.device, dtype=torch.long)
 
-        # return self.model(x, time_cond, z)
-        out = self.model(x, time_cond, z)
 
+        if return_aux:
+            pred, aux_preds = self.model(x, time_cond, z, return_aux=return_aux, cond_wavelet=cond_wavelet)
+
+            if self.concat_x_r:
+                pred = pred[:, :crop_ch, :, :]
+                aux_preds = [aux[:, :crop_ch, :, :] for aux in aux_preds]
+
+            return pred, aux_preds
+        
+        out = self.model(x, time_cond, z, return_aux=return_aux, cond_wavelet=cond_wavelet)
+        
         if self.concat_x_r:
-            return out[:, :x_r.shape[1], :, :]
+            return out[:, :crop_ch, :, :]
 
         return out
-
 
 WaveDiffNCSNpp = WaveDiffNCSNppAdapter
