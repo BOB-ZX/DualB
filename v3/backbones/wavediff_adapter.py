@@ -1,0 +1,118 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+from .ncsnpp_generator_adagn import WaveletNCSNpp
+from typing import Optional, List
+
+class WaveDiffNCSNppAdapter(nn.Module):
+    """Thin SelfRDB-compatible wrapper around WaveDiff official WaveletNCSNpp.
+
+    The official generator has forward(x, time_cond, z). SelfRDB-style runners
+    often call generator(x, t, z=None, x_r=None). This adapter preserves the
+    official backbone and only adapts the interface.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__()
+        self.config = self._build_config(kwargs)
+        self.nz = int(self.config.nz)
+        self.concat_x_r = bool(getattr(self.config, "concat_x_r", False))
+        self.model = WaveletNCSNpp(self.config)
+
+    @staticmethod
+    def _build_config(kwargs: dict[str, Any]) -> SimpleNamespace:
+        defaults = {
+            "image_size": 128,
+            "num_channels": 8,
+            "num_out_channels": 4,
+            "num_channels_dae": 64,
+            "ch_mult": [1, 2, 2, 2],
+            "num_res_blocks": 2,
+            "attn_resolutions": [16],
+            "dropout": 0.0,
+            "resamp_with_conv": True,
+            "conditional": True,
+            "fir": True,
+            "fir_kernel": [1, 3, 3, 1],
+            "skip_rescale": True,
+            "resblock_type": "biggan",
+            "progressive": "none",
+            "progressive_input": "residual",
+            "progressive_combine": "sum",
+            "embedding_type": "positional",
+            "fourier_scale": 16.0,
+            "patch_size": 1,
+            "not_use_tanh": False,
+            "z_emb_dim": 256,
+            "nz": 100,
+            "n_mlp": 3,
+            "centered": True,
+            "no_use_fbn": False,
+            "no_use_freq": False,
+            "no_use_residual": False,
+            "concat_x_r": False,
+            "deep_supervision": True,
+            "use_cgfsi": True,
+            "cgfsi_use_edge_gate": True,
+            "cgfsi_init_gamma": 0.0
+        }
+        defaults.update(kwargs)
+        #print("num_out_channels",defaults["num_out_channels"])
+        #print("num_channels",defaults["num_channels"])
+        return SimpleNamespace(**defaults)
+
+    def forward(
+        self,
+        x: Tensor,
+        t: Tensor,
+        z: Optional[Tensor] = None,
+        x_r: Optional[Tensor] = None,
+        return_aux: bool = False,
+    ) -> Tensor:
+        crop_ch = None
+
+        if self.concat_x_r:
+            if x_r is None:
+                raise ValueError("concat_x_r=True requires x_r")
+
+            crop_ch = x_r.shape[1]
+            x = torch.cat([x_r, x], dim=1)
+
+        if z is None:
+            z = torch.randn(x.shape[0], self.nz, device=x.device, dtype=x.dtype)
+
+        if t.ndim != 1:
+            t = t.reshape(x.shape[0])
+
+        if self.config.embedding_type == "fourier":
+            time_cond = t.to(device=x.device, dtype=x.dtype)
+            time_cond = torch.clamp(time_cond, min=1).div(
+                float(max(getattr(self.config, "num_timesteps", 1000), 1))
+            )
+        else:
+            time_cond = t.to(device=x.device, dtype=torch.long)
+
+
+        if return_aux:
+            pred, aux_preds = self.model(x, time_cond, z, return_aux=return_aux,)
+
+            if self.concat_x_r:
+                pred = pred[:, :crop_ch, :, :]
+                aux_preds = [aux[:, :crop_ch, :, :] for aux in aux_preds]
+
+            return pred, aux_preds
+        
+        out = self.model(x, time_cond, z, return_aux=return_aux,)
+        
+        if self.concat_x_r:
+            return out[:, :crop_ch, :, :]
+
+        return out
+
+WaveDiffNCSNpp = WaveDiffNCSNppAdapter
